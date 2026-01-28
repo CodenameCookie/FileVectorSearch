@@ -84,5 +84,6 @@ Probe a cache lock (does not force-unlock):
 - Prefer buffered reads for small files and mmap for large files only.
 - Add a pipeline model (separate walker/read/regex stages) to keep IO busy.
 - Add quick binary/filetype filtering to reduce unnecessary reads.
+- Add a --skip-dirs flag to exclude common library/build folders (node_modules, dist, target, etc.).
 - Improve WSL behavior by running the scanner inside WSL when possible.
 
