@@ -37,6 +37,7 @@ cargo build --release
 - `--cache-local` : Use local Windows cache path (LOCALAPPDATA\\file_vector_search\\cache.sqlite). PowerShell only.
 
 Notes on cache read mode:
+
 - `--cache-mode read` replays cached matches without scanning the filesystem (fast). Output is generated from the cache.
 
 ## Examples
@@ -95,16 +96,18 @@ Show the most recent run summary:
 - Progress updates print every 1,000 scanned files.
 - `--cache-unlock` is a probe; SQLite cannot force-unlock a file. If it reports locked, another process or filesystem locking is still holding it.
 
+## Recent Improvements
+
+- **Background cache writer (v0.2.0)**: Cache writes are now async via a dedicated background thread with batched SQLite transactions. Scanner threads are no longer blocked by database I/O. Includes graceful shutdown on Ctrl+C and progress logging (e.g., "Cache: 1000 entries written").
+
 ## Future Improvements
 
 - Add a cache metrics summary (cached hits vs scanned) for clearer reporting.
 - Batch cache writes per thread (transactions) to reduce first-run overhead.
 - Add a flag to cache matches-only (skip recording non-matches).
-- Move cache writes to a background writer thread to avoid blocking scans.
 - Add a flag to configure or disable the 24-hour continuation window for runs.
 - Prefer buffered reads for small files and mmap for large files only.
 - Add a pipeline model (separate walker/read/regex stages) to keep IO busy.
 - Add quick binary/filetype filtering to reduce unnecessary reads.
 - Add a --skip-dirs flag to exclude common library/build folders (node_modules, dist, target, etc.).
 - Improve WSL behavior by running the scanner inside WSL when possible.
-
