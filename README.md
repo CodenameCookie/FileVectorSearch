@@ -81,6 +81,9 @@ Probe a cache lock (does not force-unlock):
 ## Future Improvements
 
 - Add a cache metrics summary (cached hits vs scanned) for clearer reporting.
+- Batch cache writes per thread (transactions) to reduce first-run overhead.
+- Add a flag to cache matches-only (skip recording non-matches).
+- Move cache writes to a background writer thread to avoid blocking scans.
 - Prefer buffered reads for small files and mmap for large files only.
 - Add a pipeline model (separate walker/read/regex stages) to keep IO busy.
 - Add quick binary/filetype filtering to reduce unnecessary reads.
