@@ -9,6 +9,7 @@ regex = "1.10"
 memmap2 = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sysinfo = "0.35"
+ctrlc = "3.4"
 
 [dev-dependencies]
 tempfile = "3.10"

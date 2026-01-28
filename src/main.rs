@@ -60,6 +60,15 @@ impl CacheConfig {
     }
 }
 
+/// Operations sent to the background cache writer thread.
+#[derive(Debug)]
+enum CacheOp {
+    MarkFileSeen { path: PathBuf, size: i64, mtime_ns: i64 },
+    MarkDirScanned { path: PathBuf, mtime_ns: i64 },
+    RecordFileResult { path: PathBuf, size: i64, mtime_ns: i64, last_match: bool },
+    Shutdown,
+}
+
 fn now_ns() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(dur) => dur.as_nanos().min(i64::MAX as u128) as i64,
@@ -1002,6 +1011,142 @@ fn run_cache_kill() -> i32 {
     }
 }
 
+/// Background cache writer that batches SQLite writes to avoid blocking scanner threads.
+struct CacheWriter {
+    tx: Sender<CacheOp>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CacheWriter {
+    /// Spawn a background writer thread. `batch_size` is how many ops to collect before committing.
+    fn new(conn: Connection, batch_size: usize) -> Self {
+        let (tx, rx) = mpsc::channel::<CacheOp>();
+
+        let handle = std::thread::spawn(move || {
+            let mut batch: Vec<CacheOp> = Vec::with_capacity(batch_size);
+            let mut total_written: usize = 0;
+
+            // Helper to flush a batch
+            let flush_batch = |conn: &Connection, batch: &mut Vec<CacheOp>, total: &mut usize| {
+                if batch.is_empty() {
+                    return;
+                }
+                let count = batch.len();
+                let _ = conn.execute("BEGIN TRANSACTION", []);
+                for op in batch.drain(..) {
+                    match op {
+                        CacheOp::MarkFileSeen { path, size, mtime_ns } => {
+                            let dir_path = path.parent().unwrap_or_else(|| Path::new(""));
+                            let path_s = path.to_string_lossy();
+                            let dir_s = dir_path.to_string_lossy();
+                            let ts = now_ns();
+                            let _ = conn.execute(
+                                "INSERT INTO files(path, dir_path, size, mtime_ns, last_scanned_ns)
+                                 VALUES(?1, ?2, ?3, ?4, ?5)
+                                 ON CONFLICT(path) DO UPDATE SET
+                                     dir_path = excluded.dir_path,
+                                     size = excluded.size,
+                                     mtime_ns = excluded.mtime_ns,
+                                     last_scanned_ns = excluded.last_scanned_ns",
+                                params![path_s.as_ref(), dir_s.as_ref(), size, mtime_ns, ts],
+                            );
+                        }
+                        CacheOp::MarkDirScanned { path, mtime_ns } => {
+                            let path_s = path.to_string_lossy();
+                            let ts = now_ns();
+                            let _ = conn.execute(
+                                "INSERT INTO dirs(path, mtime_ns, last_scanned_ns)
+                                 VALUES(?1, ?2, ?3)
+                                 ON CONFLICT(path) DO UPDATE SET
+                                     mtime_ns = excluded.mtime_ns,
+                                     last_scanned_ns = excluded.last_scanned_ns",
+                                params![path_s.as_ref(), mtime_ns, ts],
+                            );
+                        }
+                        CacheOp::RecordFileResult { path, size, mtime_ns, last_match } => {
+                            let dir_path = path.parent().unwrap_or_else(|| Path::new(""));
+                            let path_s = path.to_string_lossy();
+                            let dir_s = dir_path.to_string_lossy();
+                            let ts = now_ns();
+                            let match_i = if last_match { 1 } else { 0 };
+                            let _ = conn.execute(
+                                "INSERT INTO files(path, dir_path, size, mtime_ns, last_scanned_ns, last_match)
+                                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                                 ON CONFLICT(path) DO UPDATE SET
+                                     dir_path = excluded.dir_path,
+                                     size = excluded.size,
+                                     mtime_ns = excluded.mtime_ns,
+                                     last_scanned_ns = excluded.last_scanned_ns,
+                                     last_match = excluded.last_match",
+                                params![path_s.as_ref(), dir_s.as_ref(), size, mtime_ns, ts, match_i],
+                            );
+                        }
+                        CacheOp::Shutdown => {} // Handled in main loop
+                    }
+                }
+                let _ = conn.execute("COMMIT", []);
+                *total += count;
+                eprintln!("Cache: {} entries written (total: {})", count, *total);
+            };
+
+            // Receive operations until Shutdown
+            loop {
+                // Try to receive with a timeout to allow periodic flushing
+                match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(CacheOp::Shutdown) => {
+                        flush_batch(&conn, &mut batch, &mut total_written);
+                        eprintln!("Cache: shutdown complete ({} total entries)", total_written);
+                        break;
+                    }
+                    Ok(op) => {
+                        batch.push(op);
+                        if batch.len() >= batch_size {
+                            flush_batch(&conn, &mut batch, &mut total_written);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Periodic flush for partial batches
+                        if !batch.is_empty() {
+                            flush_batch(&conn, &mut batch, &mut total_written);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // Channel closed, flush remaining and exit
+                        flush_batch(&conn, &mut batch, &mut total_written);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            tx,
+            handle: Some(handle),
+        }
+    }
+
+    /// Send an operation to the background writer (non-blocking).
+    fn send(&self, op: CacheOp) {
+        let _ = self.tx.send(op);
+    }
+
+    /// Shutdown the writer, flushing all pending operations.
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(CacheOp::Shutdown);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for CacheWriter {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            self.shutdown();
+        }
+    }
+}
+
 struct ThreadBuffer {
     buf: Vec<String>,
     out: Arc<Mutex<BufWriter<File>>>,
@@ -1307,6 +1452,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Create background cache writer if writes are enabled
+    let cache_writer: Option<Arc<Mutex<CacheWriter>>> = if cache_mode.allows_write() {
+        cache_config.as_ref().and_then(|cfg| {
+            cfg.open_thread_connection().map(|conn| {
+                Arc::new(Mutex::new(CacheWriter::new(conn, 1000))) // Batch size of 1000
+            })
+        })
+    } else {
+        None
+    };
+
+    // Setup graceful shutdown handler
+    let shutdown_writer = cache_writer.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\nInterrupt received, flushing cache...");
+        if let Some(w) = &shutdown_writer {
+            if let Ok(mut writer) = w.lock() {
+                writer.shutdown();
+            }
+        }
+        std::process::exit(130);
+    })?;
+
     let pat = if case_sensitive {
         pattern
     } else {
@@ -1518,6 +1686,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .and_then(|cfg| cfg.open_thread_connection());
         let cache_mode = cache_config.as_ref().map(|cfg| cfg.mode);
+        let cache_writer = cache_writer.clone();
 
         Box::new(move |result| {
             let entry = match result {
@@ -1566,10 +1735,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(logger) = &run_logger {
                                 logger.log(RunEvent::DirsSkippedInc);
                             }
-                            cache_mark_dir_scanned(conn, mode, path, &meta);
+                            // Async write via cache writer
+                            if let Some(w) = &cache_writer {
+                                if let Some(mtime_ns) = modified_time_ns(&meta) {
+                                    if let Ok(writer) = w.lock() {
+                                        writer.send(CacheOp::MarkDirScanned {
+                                            path: path.to_path_buf(),
+                                            mtime_ns,
+                                        });
+                                    }
+                                }
+                            }
                             return WalkState::Skip;
                         }
-                        cache_mark_dir_scanned(conn, mode, path, &meta);
+                        // Async write via cache writer
+                        if let Some(w) = &cache_writer {
+                            if let Some(mtime_ns) = modified_time_ns(&meta) {
+                                if let Ok(writer) = w.lock() {
+                                    writer.send(CacheOp::MarkDirScanned {
+                                        path: path.to_path_buf(),
+                                        mtime_ns,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 return WalkState::Continue;
@@ -1584,7 +1773,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let (Some(conn), Some(mode), Ok(meta_ref)) = (&cache_conn, cache_mode, &meta) {
                 if cache_skip_file(conn, mode, path, meta_ref) {
-                    cache_mark_file_seen(conn, mode, path, meta_ref);
+                    // Async write via cache writer
+                    if let Some(w) = &cache_writer {
+                        if let Some(mtime_ns) = modified_time_ns(meta_ref) {
+                            if let Ok(writer) = w.lock() {
+                                writer.send(CacheOp::MarkFileSeen {
+                                    path: path.to_path_buf(),
+                                    size: meta_ref.len() as i64,
+                                    mtime_ns,
+                                });
+                            }
+                        }
+                    }
                     cache_skipped_files.fetch_add(1, Ordering::Relaxed);
                     if let Some(logger) = &run_logger {
                         logger.log(RunEvent::CacheSkippedFilesInc);
@@ -1631,8 +1831,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(logger) = &run_logger {
                     logger.log(RunEvent::FilesMatchedInc);
                 }
-                if let (Some(conn), Some(mode), Ok(meta_ref)) = (&cache_conn, cache_mode, &meta) {
-                    cache_record_file_result(conn, mode, path, meta_ref, true);
+                if let (Some(_conn), Some(_mode), Ok(meta_ref)) = (&cache_conn, cache_mode, &meta) {
+                    if let Some(w) = &cache_writer {
+                        if let Some(mtime_ns) = modified_time_ns(meta_ref) {
+                            if let Ok(writer) = w.lock() {
+                                writer.send(CacheOp::RecordFileResult {
+                                    path: path.to_path_buf(),
+                                    size: meta_ref.len() as i64,
+                                    mtime_ns,
+                                    last_match: true,
+                                });
+                            }
+                        }
+                    }
                 }
                 return WalkState::Continue;
             }
@@ -1644,13 +1855,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(logger) = &run_logger {
                         logger.log(RunEvent::FilesMatchedInc);
                     }
-                    if let (Some(conn), Some(mode), Ok(meta_ref)) = (&cache_conn, cache_mode, &meta) {
-                        cache_record_file_result(conn, mode, path, meta_ref, true);
+                    if let (Some(_conn), Some(_mode), Ok(meta_ref)) = (&cache_conn, cache_mode, &meta) {
+                        if let Some(w) = &cache_writer {
+                            if let Some(mtime_ns) = modified_time_ns(meta_ref) {
+                                if let Ok(writer) = w.lock() {
+                                    writer.send(CacheOp::RecordFileResult {
+                                        path: path.to_path_buf(),
+                                        size: meta_ref.len() as i64,
+                                        mtime_ns,
+                                        last_match: true,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(FileSearchResult::NoMatch) => {
-                    if let (Some(conn), Some(mode), Ok(meta_ref)) = (&cache_conn, cache_mode, &meta) {
-                        cache_record_file_result(conn, mode, path, meta_ref, false);
+                    if let (Some(_conn), Some(_mode), Ok(meta_ref)) = (&cache_conn, cache_mode, &meta) {
+                        if let Some(w) = &cache_writer {
+                            if let Some(mtime_ns) = modified_time_ns(meta_ref) {
+                                if let Ok(writer) = w.lock() {
+                                    writer.send(CacheOp::RecordFileResult {
+                                        path: path.to_path_buf(),
+                                        size: meta_ref.len() as i64,
+                                        mtime_ns,
+                                        last_match: false,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(FileSearchResult::SkippedLarge) => {
@@ -1692,6 +1925,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Ok(mut w) = out_writer.lock() {
         let _ = w.flush();
+    }
+
+    // Shutdown cache writer to flush all pending writes
+    if let Some(w) = cache_writer {
+        if let Ok(mut writer) = w.lock() {
+            writer.shutdown();
+        }
     }
 
     if let Some(cfg) = &cache_config {

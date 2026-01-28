@@ -14,8 +14,11 @@ target/
 
 # Outputs and caches
 filevector_files.txt
+test.txt
 *.sqlite
 *.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
 .filevector_cache.sqlite
 owen_files.txt
 .owen_cache.sqlite
