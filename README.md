@@ -32,7 +32,12 @@ cargo build --release
 - `--cache-reset` : Reset cache schema and data.
 - `--cache-unlock` : Unlock-only mode; ignores other flags and exits after attempting to open known cache paths.
 - `--cache-kill` : Kill other running `file_vector_search` processes and exit.
+- `--last-run-duration` : Print the most recent run duration from the runs DB and exit.
+- `--last-run-summary` : Print the most recent run summary (duration + counts) and exit.
 - `--cache-local` : Use local Windows cache path (LOCALAPPDATA\\file_vector_search\\cache.sqlite). PowerShell only.
+
+Notes on cache read mode:
+- `--cache-mode read` replays cached matches without scanning the filesystem (fast). Output is generated from the cache.
 
 ## Examples
 
@@ -70,6 +75,18 @@ Probe a cache lock (does not force-unlock):
 
 ```powershell
 .\target\release\file_vector_search.exe --cache-unlock
+```
+
+Show the most recent run duration:
+
+```powershell
+.\target\release\file_vector_search.exe --last-run-duration
+```
+
+Show the most recent run summary:
+
+```powershell
+.\target\release\file_vector_search.exe --last-run-summary
 ```
 
 ## Notes

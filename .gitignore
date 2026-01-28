@@ -15,9 +15,14 @@ target/
 # Outputs and caches
 filevector_files.txt
 *.sqlite
+*.sqlite-journal
 .filevector_cache.sqlite
 owen_files.txt
 .owen_cache.sqlite
+gutenberg_owen_matches*.txt
+run-search.ps1
+run-search.txt
+run-rsync-one.ps1
 
 # Tooling
 rustup-init.exe
