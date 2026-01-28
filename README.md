@@ -35,6 +35,7 @@ cargo build --release
 - `--last-run-duration` : Print the most recent run duration from the runs DB and exit.
 - `--last-run-summary` : Print the most recent run summary (duration + counts) and exit.
 - `--cache-local` : Use local Windows cache path (LOCALAPPDATA\\file_vector_search\\cache.sqlite). PowerShell only.
+- `-h`, `--help` : Display usage information and exit.
 
 Notes on cache read mode:
 
